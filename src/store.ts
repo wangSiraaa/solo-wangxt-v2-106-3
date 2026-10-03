@@ -9,7 +9,12 @@ import type { GearInput, Pt } from './geometry/gear'
 
 export const SCHEMA_VERSION = 1
 export const DB_NAME = 'spur-gear-lab'
+export const DB_VERSION = 2
 export const STORE = 'cases'
+/** 周期轨迹元数据（TrajectoryRecord） */
+export const STORE_TRAJ = 'trajectories'
+/** 周期轨迹逐帧数据（复合键 [trajId, i]，幂等覆盖） */
+export const STORE_FRAMES = 'trajFrames'
 
 export interface CaseData {
   schemaVersion: number
@@ -32,15 +37,24 @@ export interface CaseData {
 
 let dbPromise: Promise<IDBDatabase> | null = null
 
-function openDb(): Promise<IDBDatabase> {
+export function getDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: 'id' })
         store.createIndex('updatedAt', 'updatedAt')
+      }
+      if (!db.objectStoreNames.contains(STORE_TRAJ)) {
+        const t = db.createObjectStore(STORE_TRAJ, { keyPath: 'id' })
+        t.createIndex('caseId', 'caseId')
+        t.createIndex('updatedAt', 'updatedAt')
+      }
+      if (!db.objectStoreNames.contains(STORE_FRAMES)) {
+        const f = db.createObjectStore(STORE_FRAMES, { keyPath: ['trajId', 'i'] })
+        f.createIndex('trajId', 'trajId')
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -50,7 +64,7 @@ function openDb(): Promise<IDBDatabase> {
 }
 
 function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
-  return openDb().then(
+  return getDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
         const t = db.transaction(STORE, mode)

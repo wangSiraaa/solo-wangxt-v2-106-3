@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
+import { meshCycle, actionSpan } from './geometry/cycle'
+import { runTrajectoryJob, type TrajectoryFrame } from './geometry/trajgen'
 import { intersectOutlines } from './geometry/clipper'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
@@ -14,6 +16,22 @@ import {
   saveCase,
   deleteCase
 } from './store'
+import {
+  type TrajectoryRecord,
+  type TrajectoryParams,
+  type EffectiveStatus,
+  caseFingerprint,
+  effectiveStatus,
+  newTrajectoryId,
+  saveTrajectory,
+  getTrajectory,
+  listTrajectoriesForCase,
+  deleteTrajectory,
+  recoverInterruptedTrajectories,
+  countFrames,
+  getFrames,
+  idbFrameSink
+} from './trajectoryStore'
 
 // ------- 参数（内部全部 mm / 度） -------
 const unit = ref<LengthUnit>('mm')
@@ -32,6 +50,20 @@ const g1 = shallowRef<GearGeometry>()
 const g2 = shallowRef<GearGeometry>()
 const mesh = shallowRef<MeshInfo>()
 
+/** 当前几何的（参数+轮廓）指纹：轨迹有效性以此为基准 */
+const currentFingerprint = ref('')
+
+function currentTrajParams(): TrajectoryParams {
+  return {
+    z1: Math.round(gearParams.z1),
+    z2: Math.round(gearParams.z2),
+    module: gearParams.m,
+    alphaDeg: gearParams.alphaDeg,
+    faceWidth: gearParams.faceWidth,
+    centerDistance: gearParams.useStandardCenter ? null : gearParams.centerDistance
+  }
+}
+
 const errors = reactive({ g1: [] as string[], g2: [] as string[] })
 
 function rebuild() {
@@ -46,6 +78,7 @@ function rebuild() {
     ? g1.value.pitchR + g2.value.pitchR
     : gearParams.centerDistance
   mesh.value = analyzeMesh({ g1: g1.value, g2: g2.value, centerDistance: a })
+  currentFingerprint.value = caseFingerprint(currentTrajParams(), g1.value.outline, g2.value.outline)
 }
 
 // ------- 单位输入辅助（数值随单位换算；内部 mm 不变） -------
@@ -105,6 +138,179 @@ async function checkInterference(currentPhi1: number) {
   }
 }
 
+// ------- 啮合周期回放 -------
+const cycleInfo = computed(() =>
+  g1.value && g2.value ? meshCycle(g1.value.input.z, g2.value.input.z) : null
+)
+const framesPerEngagement = ref(6)
+const estimatedFrames = computed(() =>
+  cycleInfo.value ? cycleInfo.value.pairsPerCycle * (Math.max(1, framesPerEngagement.value) + 1) + 1 : 0
+)
+
+const trajectories = ref<TrajectoryRecord[]>([])
+const trajJob = reactive({ running: false, done: 0, total: 0, id: '' })
+let trajCancelFlag = false
+
+const replay = reactive({
+  active: false,
+  trajId: '',
+  frames: [] as TrajectoryFrame[],
+  index: 0,
+  playing: false,
+  fps: 30,
+  expired: false,
+  pairsPerCycle: 0
+})
+let replayAcc = 0
+
+const currentFrame = computed<TrajectoryFrame | null>(() =>
+  replay.active && replay.frames.length ? replay.frames[replay.index] : null
+)
+
+async function refreshTrajectories() {
+  trajectories.value = currentCaseId.value ? await listTrajectoriesForCase(currentCaseId.value) : []
+}
+
+function trajStatus(rec: TrajectoryRecord): EffectiveStatus {
+  return effectiveStatus(rec, currentFingerprint.value || null)
+}
+
+const STATUS_LABELS: Record<EffectiveStatus, string> = {
+  running: '生成中…',
+  cancelled: '已取消（可继续）',
+  failed: '失败',
+  completed: '完成 ✅（当前有效）',
+  expired: '已过期（历史，仅供查看）'
+}
+function statusLabel(s: EffectiveStatus) {
+  return STATUS_LABELS[s]
+}
+
+/** 生成（或继续生成）一条轨迹；长任务，逐帧 Clipper 求交，可取消 */
+async function runTrajJob(rec: TrajectoryRecord) {
+  if (!g1.value || !g2.value || !mesh.value) return
+  trajJob.running = true
+  trajJob.id = rec.id
+  trajCancelFlag = false
+  try {
+    const result = await runTrajectoryJob({
+      g1: g1.value,
+      g2: g2.value,
+      mesh: mesh.value,
+      trajId: rec.id,
+      framesPerEngagement: rec.framesPerEngagement,
+      sink: idbFrameSink(rec.id),
+      shouldCancel: () => trajCancelFlag,
+      onProgress: (done, total) => {
+        trajJob.done = done
+        trajJob.total = total
+      },
+      yieldControl: () => new Promise((r) => setTimeout(r, 0))
+    })
+    const fresh = await getTrajectory(rec.id)
+    if (fresh) {
+      fresh.status = result === 'completed' ? 'completed' : 'cancelled'
+      fresh.framesDone = await countFrames(rec.id)
+      await saveTrajectory(fresh)
+    }
+  } catch (e) {
+    const fresh = await getTrajectory(rec.id)
+    if (fresh) {
+      fresh.status = 'failed'
+      fresh.error = String((e as Error)?.message ?? e)
+      fresh.framesDone = await countFrames(rec.id)
+      await saveTrajectory(fresh)
+    }
+  } finally {
+    trajJob.running = false
+    await refreshTrajectories()
+  }
+}
+
+async function generateTrajectory() {
+  if (!g1.value || !g2.value || !mesh.value || trajJob.running) return
+  // 轨迹必须绑定持久化案例：参数未保存或已修改时先存一个快照案例
+  if (!currentCaseId.value || paramsDirty) await saveCurrent(false)
+  const caseId = currentCaseId.value!
+  const cycle = cycleInfo.value!
+  const [sEnter, sExit] = actionSpan(mesh.value)
+  const rec: TrajectoryRecord = {
+    id: newTrajectoryId(),
+    caseId,
+    name: `${caseName.value || '案例'} · ${new Date().toLocaleString()}`,
+    fingerprint: currentFingerprint.value,
+    params: currentTrajParams(),
+    cycle,
+    sEnter,
+    sExit,
+    framesPerEngagement: Math.max(1, Math.round(framesPerEngagement.value)),
+    frameCount: cycle.pairsPerCycle * (Math.max(1, Math.round(framesPerEngagement.value)) + 1) + 1,
+    framesDone: 0,
+    status: 'running',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  }
+  await saveTrajectory(rec)
+  await refreshTrajectories()
+  await runTrajJob(rec)
+}
+
+function cancelTrajectory() {
+  trajCancelFlag = true
+}
+
+/** 续算：仅当轨迹指纹与当前参数一致才有意义（几何相同，帧号确定，幂等） */
+async function resumeTrajectory(rec: TrajectoryRecord) {
+  if (trajJob.running) return
+  if (rec.fingerprint !== currentFingerprint.value) return
+  await saveTrajectory({ ...rec, status: 'running' })
+  await refreshTrajectories()
+  await runTrajJob(rec)
+}
+
+async function removeTrajectory(id: string) {
+  if (replay.trajId === id) exitReplay()
+  await deleteTrajectory(id)
+  await refreshTrajectories()
+}
+
+async function startReplay(rec: TrajectoryRecord) {
+  const frames = await getFrames(rec.id)
+  if (!frames.length) return
+  playing.value = false
+  replay.active = true
+  replay.trajId = rec.id
+  replay.frames = frames
+  replay.index = 0
+  replay.playing = false
+  replay.expired = trajStatus(rec) === 'expired'
+  replay.pairsPerCycle = rec.cycle.pairsPerCycle
+  replayAcc = 0
+}
+
+function exitReplay() {
+  replay.active = false
+  replay.playing = false
+  replay.trajId = ''
+  replay.frames = []
+  interferenceArea.value = null
+  interferenceRegions.value = []
+}
+
+/** 跳到下一个/上一个有干涉记录的帧（干涉记录可定位） */
+function jumpInterference(dir: 1 | -1) {
+  const n = replay.frames.length
+  if (!n) return
+  for (let step = 1; step <= n; step++) {
+    const idx = (replay.index + dir * step + n * step) % n
+    if (replay.frames[idx].interferes) {
+      replay.index = idx
+      replay.playing = false
+      return
+    }
+  }
+}
+
 // ------- 视图 -------
 const host = ref<HTMLDivElement>()
 let viewer: GearViewer | null = null
@@ -126,20 +332,42 @@ onMounted(() => {
   const loop = (t: number) => {
     const dt = Math.min(0.05, (t - lastT) / 1000 || 0)
     lastT = t
-    if (playing.value && g1.value && g2.value && mesh.value) {
-      phi1.value += speed.value * dt
-      // 归一到一个齿距周期，避免数值增长
-      const period = (2 * Math.PI) / g1.value.input.z
-      phi1.value = ((phi1.value % period) + period) % period
-      // 接触点 s 随 φ1 同步：dφ1/ds = 1/rb1，相位常量按节点对齐
-      const s = (phi1.value - (gearAnglesAt(mesh.value, g1.value, g2.value, 0).phi1)) * g1.value.baseR
-      contactS.value = clampS(s)
-    }
-    if (g1.value && g2.value && mesh.value) {
-      const p2 = mateAngle(g1.value, g2.value, mesh.value, phi1.value)
-      viewer!.setAngles(phi1.value, p2)
-      showOpts.contactS = contactS.value
+    if (replay.active && replay.frames.length) {
+      // 周期回放：角度/接触点/干涉全部取自轨迹帧（严格相位序列），不做自由旋转
+      if (replay.playing) {
+        replayAcc += dt * replay.fps
+        while (replayAcc >= 1) {
+          replayAcc -= 1
+          if (replay.index < replay.frames.length - 1) replay.index++
+          else {
+            replay.playing = false // 播到重复位置停止；拖回滑块可重播
+            break
+          }
+        }
+      }
+      const f = replay.frames[replay.index]
+      viewer!.setAngles(f.phi1, f.phi2)
+      contactS.value = f.s
+      interferenceArea.value = f.interferenceArea
+      interferenceRegions.value = f.regions
+      showOpts.contactS = f.s
       pushOverlay()
+    } else {
+      if (playing.value && g1.value && g2.value && mesh.value) {
+        phi1.value += speed.value * dt
+        // 归一到一个齿距周期，避免数值增长
+        const period = (2 * Math.PI) / g1.value.input.z
+        phi1.value = ((phi1.value % period) + period) % period
+        // 接触点 s 随 φ1 同步：dφ1/ds = 1/rb1，相位常量按节点对齐
+        const s = (phi1.value - (gearAnglesAt(mesh.value, g1.value, g2.value, 0).phi1)) * g1.value.baseR
+        contactS.value = clampS(s)
+      }
+      if (g1.value && g2.value && mesh.value) {
+        const p2 = mateAngle(g1.value, g2.value, mesh.value, phi1.value)
+        viewer!.setAngles(phi1.value, p2)
+        showOpts.contactS = contactS.value
+        pushOverlay()
+      }
     }
     requestAnimationFrame(loop)
   }
@@ -165,6 +393,9 @@ function clampS(s: number) {
 watch(
   () => [gearParams.z1, gearParams.z2, gearParams.m, gearParams.alphaDeg, gearParams.faceWidth, gearParams.useStandardCenter, gearParams.centerDistance],
   () => {
+    paramsDirty = true
+    trajCancelFlag = true // 参数变了：正在生成的轨迹失去意义，安全取消（已写帧保留为历史）
+    if (replay.active) exitReplay()
     rebuild()
     if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
     phi1.value = 0
@@ -195,11 +426,20 @@ function scrubContact() {
 const cases = ref<CaseData[]>([])
 const caseName = ref('未命名案例')
 const caseNote = ref('')
+/** 当前参数对应的已存案例 id；轨迹记录挂在它下面 */
+const currentCaseId = ref<string | null>(null)
+/** 参数自上次保存/载入后是否被修改过 */
+let paramsDirty = true
 
 async function refreshCases() {
   cases.value = await listCases()
 }
-onMounted(refreshCases)
+onMounted(async () => {
+  // 上次会话若有"生成中"的轨迹，说明页面被刷新/关闭中断：降级为"已取消"，可安全续算
+  await recoverInterruptedTrajectories()
+  await refreshCases()
+  await refreshTrajectories()
+})
 
 function currentCaseData(withOutlines: boolean): CaseData {
   const a = mesh.value?.a ?? gearParams.centerDistance
@@ -234,8 +474,12 @@ function currentCaseData(withOutlines: boolean): CaseData {
 }
 
 async function saveCurrent(withOutlines: boolean) {
-  await saveCase(currentCaseData(withOutlines))
+  const data = currentCaseData(withOutlines)
+  await saveCase(data)
+  currentCaseId.value = data.id
+  paramsDirty = false
   await refreshCases()
+  await refreshTrajectories()
 }
 
 function exportCase(withOutlines: boolean) {
@@ -243,6 +487,7 @@ function exportCase(withOutlines: boolean) {
 }
 
 async function loadCase(c: CaseData) {
+  if (replay.active) exitReplay()
   gearParams.z1 = c.gear1.z
   gearParams.z2 = c.gear2.z
   gearParams.m = c.gear1.module
@@ -259,9 +504,19 @@ async function loadCase(c: CaseData) {
   caseNote.value = c.note
   rebuild()
   if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  await nextTick() // 等参数 watcher 跑完再落定"未修改"状态，避免被误标为已修改
+  currentCaseId.value = c.id
+  paramsDirty = false
+  await refreshTrajectories()
 }
 
 async function removeCase(id: string) {
+  // 级联删除该案例下的轨迹（记录 + 帧）
+  for (const tr of await listTrajectoriesForCase(id)) await deleteTrajectory(tr.id)
+  if (currentCaseId.value === id) {
+    currentCaseId.value = null
+    trajectories.value = []
+  }
   await deleteCase(id)
   await refreshCases()
 }
@@ -370,23 +625,88 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
         <section>
           <h2>运动 / 检查</h2>
           <div class="row">
-            <button @click="pause" :disabled="!playing">暂停</button>
-            <button @click="resume" :disabled="playing">继续</button>
+            <button @click="pause" :disabled="!playing || replay.active">暂停</button>
+            <button @click="resume" :disabled="playing || replay.active">继续</button>
           </div>
           <label>轮1 角速度（rad/s）
-            <input type="range" v-model.number="speed" min="0" max="1.5" step="0.01" />
+            <input type="range" v-model.number="speed" min="0" max="1.5" step="0.01" :disabled="replay.active" />
           </label>
           <label>接触点沿啮合线 s（mm，暂停可拖动）
-            <input type="range" :disabled="playing" v-model.number="contactS" :min="sBounds[0]" :max="sBounds[1]" step="0.05" @input="scrubContact" />
+            <input type="range" :disabled="playing || replay.active" v-model.number="contactS" :min="sBounds[0]" :max="sBounds[1]" step="0.05" @input="scrubContact" />
           </label>
-          <button class="wide" @click="checkInterference(phi1)" :disabled="playing || interferenceBusy">
+          <button class="wide" @click="checkInterference(phi1)" :disabled="playing || interferenceBusy || replay.active">
             {{ interferenceBusy ? 'Clipper 求交中…' : '在当前帧做局部干涉求交（Clipper2 WASM）' }}
           </button>
-          <div v-if="interferenceArea !== null" class="report">
+          <div v-if="interferenceArea !== null && !replay.active" class="report">
             重叠面积 = {{ interferenceArea.toExponential(3) }} mm²
             <b :class="interferenceArea > 1e-6 ? 'bad' : 'good'">
               {{ interferenceArea > 1e-6 ? '存在实体干涉 ❗' : '当前帧无干涉 ✅' }}
             </b>
+          </div>
+        </section>
+
+        <section>
+          <h2>啮合周期回放</h2>
+          <div v-if="cycleInfo" class="report">
+            <div>每周期啮合次数 lcm(z₁,z₂)：<b>{{ cycleInfo.pairsPerCycle }}</b>（gcd = {{ cycleInfo.gcd }}）</div>
+            <div>重复周期：轮1 转 <b>{{ cycleInfo.rev1 }}</b> 周 / 轮2 转 <b>{{ cycleInfo.rev2 }}</b> 周</div>
+            <div>周期转角 φ₁：<b>{{ cycleInfo.periodPhi1.toFixed(3) }}</b> rad（{{ (cycleInfo.periodPhi1 / DEG).toFixed(1) }}°）</div>
+            <div v-if="cycleInfo.gcd === 1" class="dim">z₁、z₂ 互质：每颗齿都要与对方全部齿各啮合一次才重复，周期最长。</div>
+          </div>
+          <label>每次啮合采样帧数（含两端）
+            <input type="number" v-model.number="framesPerEngagement" min="1" max="40" step="1" :disabled="trajJob.running" />
+          </label>
+          <div class="dim">预计 {{ estimatedFrames }} 帧，逐帧 Clipper 求交；帧数大时耗时较长，可随时取消、稍后继续。</div>
+          <div class="row">
+            <button @click="generateTrajectory" :disabled="trajJob.running || !!errors.g1.length || !!errors.g2.length || replay.active">
+              {{ trajJob.running ? `生成中 ${trajJob.done}/${trajJob.total}…` : '生成周期轨迹' }}
+            </button>
+            <button v-if="trajJob.running" @click="cancelTrajectory">取消</button>
+          </div>
+          <div v-if="trajJob.running" class="progress"><div class="bar" :style="{ width: (100 * trajJob.done / Math.max(1, trajJob.total)) + '%' }"></div></div>
+          <ul class="caselist trajlist">
+            <li v-for="tr in trajectories" :key="tr.id" :class="{ expired: trajStatus(tr) === 'expired' }">
+              <div class="ci">
+                <b>{{ tr.name }}</b>
+                <span>{{ tr.framesDone }}/{{ tr.frameCount }} 帧 · {{ statusLabel(trajStatus(tr)) }}</span>
+                <span v-if="tr.status === 'failed' && tr.error" class="bad">{{ tr.error }}</span>
+              </div>
+              <div class="ca">
+                <button @click="startReplay(tr)" :disabled="tr.framesDone === 0 || trajJob.running">回放</button>
+                <button v-if="(tr.status === 'cancelled' || tr.status === 'failed') && trajStatus(tr) !== 'expired'"
+                        @click="resumeTrajectory(tr)" :disabled="trajJob.running">继续</button>
+                <button class="del" @click="removeTrajectory(tr.id)" :disabled="trajJob.running && trajJob.id === tr.id">删</button>
+              </div>
+            </li>
+            <li v-if="!trajectories.length" class="empty">当前案例暂无轨迹（生成时自动保存案例快照）</li>
+          </ul>
+          <div v-if="replay.active" class="replay">
+            <div class="row">
+              <button @click="replay.playing = true" :disabled="replay.playing">播放</button>
+              <button @click="replay.playing = false" :disabled="!replay.playing">暂停</button>
+              <button @click="exitReplay">退出回放</button>
+            </div>
+            <label>帧 {{ replay.index + 1 }} / {{ replay.frames.length }}（可精确跳转）
+              <input type="range" min="0" :max="Math.max(0, replay.frames.length - 1)" step="1"
+                     v-model.number="replay.index" @input="replay.playing = false" />
+            </label>
+            <div class="row">
+              <button @click="jumpInterference(-1)">← 上一干涉帧</button>
+              <button @click="jumpInterference(1)">下一干涉帧 →</button>
+            </div>
+            <div v-if="currentFrame" class="report">
+              <div>
+                <template v-if="currentFrame.engagement >= replay.pairsPerCycle"><b>重复位置</b>（与首帧同一对齿、同一接触相位）·</template>
+                <template v-else>啮合序号 <b>{{ currentFrame.engagement + 1 }}</b>/{{ replay.pairsPerCycle }} ·</template>
+                齿对：轮1 第 <b>{{ currentFrame.k1 }}</b> 齿 × 轮2 第 <b>{{ currentFrame.k2 }}</b> 齿
+              </div>
+              <div>s = {{ currentFrame.s.toFixed(3) }} mm · 接触点 ({{ currentFrame.cx.toFixed(2) }}, {{ currentFrame.cy.toFixed(2) }})</div>
+              <div>φ₁ = {{ currentFrame.phi1.toFixed(4) }} rad · φ₂ = {{ currentFrame.phi2.toFixed(4) }} rad</div>
+              <div>局部干涉面积 = {{ currentFrame.interferenceArea.toExponential(3) }} mm²
+                <b :class="currentFrame.interferes ? 'bad' : 'good'">{{ currentFrame.interferes ? '干涉 ❗' : '无干涉 ✅' }}</b>
+              </div>
+            </div>
+            <div v-if="replay.expired" class="warns">⚠️ 历史轨迹：案例参数已修改，仅供回看，不代表当前参数的有效结果。</div>
           </div>
         </section>
 
