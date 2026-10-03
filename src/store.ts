@@ -6,10 +6,13 @@
  */
 import type { LengthUnit } from './units'
 import type { GearInput, Pt } from './geometry/gear'
+import type { TrajectoryRecord } from './trajectoryStore'
 
 export const SCHEMA_VERSION = 1
 export const DB_NAME = 'spur-gear-lab'
+export const DB_VERSION = 2
 export const STORE = 'cases'
+export const TRAJ_STORE = 'trajectories'
 
 export interface CaseData {
   schemaVersion: number
@@ -28,19 +31,30 @@ export interface CaseData {
     gear1: Pt[]
     gear2: Pt[]
   }
+  /**
+   * 导出时可附带的已完成啮合周期轨迹（与参数指纹绑定）。
+   * 不存在/为空表示该案例未生成轨迹，载入后绝不被当作“已验证”结果。
+   */
+  trajectories?: TrajectoryRecord[]
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
 
-function openDb(): Promise<IDBDatabase> {
+/** 共享连接：cases(v1) + trajectories(v2)，避免两处以不同版本打开同一库 */
+export function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
   dbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(STORE)) {
         const store = db.createObjectStore(STORE, { keyPath: 'id' })
         store.createIndex('updatedAt', 'updatedAt')
+      }
+      if (!db.objectStoreNames.contains(TRAJ_STORE)) {
+        const t = db.createObjectStore(TRAJ_STORE, { keyPath: 'trajId' })
+        t.createIndex('caseId', 'caseId')
+        t.createIndex('updatedAt', 'updatedAt')
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -49,12 +63,12 @@ function openDb(): Promise<IDBDatabase> {
   return dbPromise
 }
 
-function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+export function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest<T>, storeName = STORE): Promise<T> {
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const t = db.transaction(STORE, mode)
-        const req = fn(t.objectStore(STORE))
+        const t = db.transaction(storeName, mode)
+        const req = fn(t.objectStore(storeName))
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })

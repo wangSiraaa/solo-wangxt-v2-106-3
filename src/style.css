@@ -82,3 +82,28 @@ th { color: #9fb4cf; font-weight: 600; }
 .ca { display: flex; gap: 4px; align-items: center; }
 .ca button { flex: 0 0 auto; padding: 3px 8px; }
 .empty { color: #6b7686; justify-content: center !important; }
+
+/* 啮合周期回放 */
+.replay-panel { border: 1px solid #2b5ea855; border-radius: 8px; padding: 8px; background: #0e1420; }
+.replay-meta { font-size: 11.5px; color: #aab6c6; }
+.replay-meta .sub { color: #7f8b9c; font-size: 11px; margin: 2px 0 6px; }
+.replay-meta select { background: #0d1219; color: #e6edf5; border: 1px solid #2a3645; border-radius: 6px; padding: 3px; }
+.replay-done { border-color: #2f7d5b; }
+.player { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #2a3645; }
+.player h3 { font-size: 12px; margin: 0 0 6px; color: #9fb4cf; display: flex; align-items: center; gap: 6px; }
+.badge { font-size: 10px; font-style: normal; padding: 1px 6px; border-radius: 8px; }
+.badge.current { background: #1d4d38; color: #3ddc91; }
+.badge.stale { background: #4d3a1d; color: #ffc466; }
+.frameinfo { font-size: 11px; background: #0d1219; border: 1px solid #2a3645; border-radius: 6px; padding: 6px 8px; margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.phase-tag { padding: 0 6px; border-radius: 8px; font-style: normal; margin-left: 4px; }
+.phase-tag.enter { background: #2b3a66; color: #9fc0ff; }
+.phase-tag.exit { background: #4d2b5c; color: #d59fff; }
+.phase-tag.pitch { background: #1d4d38; color: #3ddc91; }
+.pairchip { display: inline-block; background: #1a2433; border-radius: 6px; padding: 0 5px; margin: 0 2px; font-size: 10.5px; color: #9fb4cf; }
+.trajlist { list-style: none; margin: 0; padding: 0; }
+.trajlist li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 2px; border-bottom: 1px solid #1e2835; font-size: 12px; }
+.trajlist li.stale { opacity: .72; }
+.trajlist i { font-style: normal; }
+.trajlist i.good { color: #3ddc91; }
+.trajlist i.bad { color: #ff5c75; }
+.trajlist i.stale { color: #ffc466; }

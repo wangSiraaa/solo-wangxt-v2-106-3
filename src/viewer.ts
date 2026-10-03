@@ -37,6 +37,7 @@ export class GearViewer {
   private pitchPoint: THREE.Mesh | null = null
   private contactMarker: THREE.Mesh | null = null
   private interferenceGroup: THREE.Group
+  private replayGroup: THREE.Group
   private raycaster = new THREE.Raycaster()
   private container: HTMLElement
   private resizeObs: ResizeObserver
@@ -82,6 +83,9 @@ export class GearViewer {
 
     this.interferenceGroup = new THREE.Group()
     this.scene.add(this.interferenceGroup)
+
+    this.replayGroup = new THREE.Group()
+    this.scene.add(this.replayGroup)
 
     this.resizeObs = new ResizeObserver(() => this.resize())
     this.resizeObs.observe(container)
@@ -298,6 +302,123 @@ export class GearViewer {
     while (this.interferenceGroup.children.length) {
       const c = this.interferenceGroup.children.pop()!
       ;(c as THREE.Mesh).geometry?.dispose()
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 啮合周期回放覆盖物
+  // -------------------------------------------------------------------------
+
+  /** 回放轨迹的静态标注：干涉相位（红块）、周期内全部接触点轨迹（淡绿） */
+  setReplayLocus(opts: {
+    /** 周期内主接触点轨迹（世界坐标，按相位排序） */
+    contactLocus?: Pt[]
+    /** 发生干涉的帧接触点（世界坐标，可定位风险相位） */
+    riskPoints?: Pt[]
+    visible?: boolean
+  }) {
+    this.clearReplayLocus()
+    if (opts.visible === false) return
+    const z = 2.4
+
+    if (opts.contactLocus && opts.contactLocus.length > 1) {
+      const verts = opts.contactLocus.map((p) => new THREE.Vector3(p.x, p.y, z))
+      const geo = new THREE.BufferGeometry().setFromPoints(verts)
+      const line = new THREE.Line(
+        geo,
+        new THREE.LineBasicMaterial({
+          color: 0x39e66b,
+          transparent: true,
+          opacity: 0.35,
+          depthTest: false
+        })
+      )
+      line.renderOrder = 40
+      line.name = 'replay-locus'
+      this.replayGroup.add(line)
+    }
+
+    if (opts.riskPoints?.length) {
+      const geo = new THREE.SphereGeometry(0.9, 12, 12)
+      const mat = new THREE.MeshBasicMaterial({ color: 0xff5533, depthTest: false })
+      for (const p of opts.riskPoints) {
+        const m = new THREE.Mesh(geo, mat)
+        m.position.set(p.x, p.y, z + 0.2)
+        m.renderOrder = 70
+        m.name = 'replay-risk'
+        this.replayGroup.add(m)
+      }
+    }
+  }
+
+  /** 当前回放帧：相位对应的接触点（青色高亮）与该帧干涉区域（红） */
+  setReplayFrame(frame: {
+    contactPoint: Pt | null
+    regions: Pt[][]
+    interferes: boolean
+  } | null) {
+    this.clearReplayFrame()
+    if (!frame) return
+
+    if (frame.regions.length) {
+      for (const ring of frame.regions) {
+        if (ring.length < 3) continue
+        const shape = new THREE.Shape()
+        shape.moveTo(ring[0].x, ring[0].y)
+        for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
+        shape.closePath()
+        const geo = new THREE.ShapeGeometry(shape)
+        const mat = new THREE.MeshBasicMaterial({
+          color: 0xff2d55,
+          transparent: true,
+          opacity: 0.55,
+          side: THREE.DoubleSide,
+          depthTest: false
+        })
+        const m = new THREE.Mesh(geo, mat)
+        m.position.z = 2.2
+        m.renderOrder = 90
+        m.name = 'replay-frame-region'
+        this.replayGroup.add(m)
+      }
+    }
+
+    if (frame.contactPoint) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(1.2, 20, 20),
+        new THREE.MeshBasicMaterial({
+          color: frame.interferes ? 0xff5533 : 0x35e0ff,
+          depthTest: false
+        })
+      )
+      m.position.set(frame.contactPoint.x, frame.contactPoint.y, 2.8)
+      m.renderOrder = 95
+      m.name = 'replay-frame-marker'
+      this.replayGroup.add(m)
+    }
+  }
+
+  private clearReplayLocus() {
+    for (const c of [...this.replayGroup.children]) {
+      if (c.name === 'replay-frame-marker' || c.name === 'replay-frame-region') continue
+      ;(c as THREE.Mesh).geometry?.dispose()
+      this.replayGroup.remove(c)
+    }
+  }
+
+  private clearReplayFrame() {
+    for (const c of [...this.replayGroup.children]) {
+      if (c.name === 'replay-frame-marker' || c.name === 'replay-frame-region') {
+        ;(c as THREE.Mesh).geometry?.dispose()
+        this.replayGroup.remove(c)
+      }
+    }
+  }
+
+  clearReplay() {
+    for (const c of [...this.replayGroup.children]) {
+      ;(c as THREE.Mesh).geometry?.dispose()
+      this.replayGroup.remove(c)
     }
   }
 
